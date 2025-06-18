@@ -8,8 +8,10 @@ from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import Whitespace
 import argparse
 from datasets import Dataset as ds
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler, DataLoader
+from torch.nn.utils.rnn import pad_sequence
 import pandas as pd
+import random
 
 
 def get_args():
@@ -20,7 +22,7 @@ def get_args():
     parser.add_argument("--val_dim", type=int, default=64)
     parser.add_argument("--hidden_dim", type=int, default=2048)
     parser.add_argument("--num_encoder_layers", type=int, default=64)
-    parser.add_argument("--seq_length", type=int, default=25000)
+    parser.add_argument("--tokens_per_batch", type=int, default=25000)
     parser.add_argument("--vocab_size", type=int, default=37000)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--warmup_steps", type=int, default=4000)
@@ -33,20 +35,20 @@ def get_args():
     parser.add_argument("--test_path", type=str, default="./data/wmt14_translate_de-en_test.csv")
     parser.add_argument("--val_path", type=str, default="./data/wmt14_translate_de-en_validation.csv")
     parser.add_argument("--tokenizer_path", type=str, default=None)
+    parser.add_argument("--chunk", type=int, default=64)
+    parser.add_argument("--device", type=str, default='cuda')
 
     return parser.parse_args()
 
-def positional_encoding(vocab_size, model_dim):
+def positional_encoding(num_tokens, model_dim):
 
-    position = torch.arange(vocab_size).unsqueeze(1)
+    position = torch.arange(num_tokens).unsqueeze(1)
     div_term = torch.exp(torch.arange(0, model_dim, 2) * (-math.log(10000.0) / model_dim))
-    pe = torch.zeros(vocab_size, 1, model_dim)
-    pe[:, 0, 0::2] = torch.sin(position * div_term)
-    pe[:, 0, 1::2] = torch.cos(position * div_term)
+    pe = torch.zeros(num_tokens, model_dim)
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
 
-    return pe
-
-
+    return pe.unsqueeze(0)
 
 class ScaledDotProdAttention(nn.Module):
     def __init__(self):
@@ -188,45 +190,55 @@ class Transformer(nn.Module):
     def __init__(self, num_heads, model_dim, key_dim, val_dim, hidden_dim, num_encoder_layers, vocab_size):
         super(Transformer, self).__init__()
 
-        self.linear = nn.Linear(in_features=vocab_size, out_features=model_dim, bias=False)
+        self.model_dim = model_dim
+        self.embedding = nn.Embedding(num_embeddings=vocab_size, embedding_dim=model_dim)
 
         self.encoder = nn.ModuleList([EncoderLayer(model_dim, num_heads, key_dim, val_dim, hidden_dim) for _ in range(num_encoder_layers)])
         self.decoder = nn.ModuleList([DecoderLayer(model_dim, num_heads, key_dim, val_dim, hidden_dim) for _ in range(num_encoder_layers)])
 
-        self.pos_encoding = positional_encoding(vocab_size, model_dim)
+    def forward(self, src, target):
 
-    def forward(self, input, output):
+        src_embedding = self.embedding(src)
+        target_embedding = self.embedding(target)
 
-        breakpoint()
+        src_embedding = src_embedding + positional_encoding(src.size(1), self.model_dim)
+        target_embedding = target_embedding + positional_encoding(target.size(1), self.model_dim)
 
-        input_embedding = self.linear(input)
-        output_embedding = self.linear(output)
-
-        input_embedding = input_embedding + self.pos_encoding
-        output_embedding = output_embedding + self.pos_encoding
-
-        encoder_out = input_embedding
+        encoder_out = src_embedding
 
         for encoder_layer in self.encoder:
             encoder_out = encoder_layer(encoder_out)
         
-        decoder_out = output_embedding
+        decoder_out = target_embedding
 
         for decoder_layer in self.decoder:
             decoder_out = decoder_layer(decoder_out, encoder_out)
+        
+        breakpoint()
         
         out = self.linear(decoder_out)
         
         return out
 
+def collate_fn(data):
+
+    src_batch, target_batch = zip(*data)
+
+    src_batch = [torch.tensor(x, dtype=torch.long) for x in src_batch]
+    target_batch = [torch.tensor(x, dtype=torch.long) for x in target_batch]
+
+    src_padded = pad_sequence(src_batch, batch_first=True, padding_value=0)
+    target_padded = pad_sequence(target_batch, batch_first=True, padding_value=0)
+
+    return src_padded, target_padded
+
 class TokenizedDataset(Dataset):
 
-    def __init__(self, data_path, seq_length, vocab_size, batch_size, tokenizer_file=None):
+    def __init__(self, data_path, vocab_size, chunk, tokenizer_file=None):
 
         self.dataset = ds.from_pandas(pd.read_csv(data_path, lineterminator='\n'))
-        self.seq_length = seq_length
         self.data_path = data_path
-        self.batch_size = batch_size
+        self.chunk = chunk
         self.vocab_size = vocab_size
         self.tokenizer_file = tokenizer_file
         self.tokenizer = self._get_tokenizer()
@@ -235,8 +247,8 @@ class TokenizedDataset(Dataset):
 
         def batch_iterator():
             for lang in ['en', 'de']:
-                for i in range(0, len(self.dataset), self.batch_size):
-                    yield self.dataset[i:i+self.batch_size][lang]
+                for i in range(0, len(self.dataset), self.chunk):
+                    yield self.dataset[i:i+self.chunk][lang]
 
         if self.tokenizer_file:
             tokenizer = Tokenizer.from_file(self.tokenizer_file)
@@ -246,7 +258,7 @@ class TokenizedDataset(Dataset):
             trainer = BpeTrainer(
                 vocab_size=self.vocab_size,
                 show_progress=True,
-                special_tokens=['<pad>', '<unk>', '<bos>', '<eos>']
+                special_tokens=['<pad>', '<unk>', '<s>', '</s>']
                 )
             
             tokenizer.train_from_iterator(
@@ -255,23 +267,77 @@ class TokenizedDataset(Dataset):
             )
 
             tokenizer.save("bpe_tokenizer.json")
-
+        
         return tokenizer
     
     def __getitem__(self, index):
-        breakpoint()
+        
+        src_ids = self.tokenizer.encode(str(self.dataset[index]['de'])).ids
+        target_ids = self.tokenizer.encode(str(self.dataset[index]['en'])).ids
+
+        return src_ids, target_ids
+    
+    def __len__(self):
+
+        return len(self.dataset)
+
+class TokenBatchSampler(Sampler):
+    def __init__(self, dataset, tokens_per_batch, shuffle=True):
+        self.tokens_per_batch = tokens_per_batch
+        self.shuffle = shuffle
+        self.indices = list(range(len(dataset)))
+        self.dataset = dataset
+
+    def __iter__(self):
+        if self.shuffle:
+            random.shuffle(self.indices)
+        
+        batch = []
+        src_token_counter, target_token_counter = 0, 0
+
+        for idx in self.indices:
+            src_len, target_len = len(self.dataset[idx][0]), len(self.dataset[idx][1])
+            src_token_counter += src_len
+            target_token_counter += target_len
+            if src_token_counter >= self.tokens_per_batch or target_token_counter >= self.tokens_per_batch:
+                if batch:
+                    yield batch
+                    batch = []
+                    src_token_counter, target_token_counter = 0, 0
+            batch.append(idx)
+        
+        if batch:
+            yield batch
 
 def train(model, args):
 
+    if args.device == 'cuda':
+        device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
     train_dataset = TokenizedDataset(
         data_path=args.train_path,
-        seq_length=args.seq_length,
         vocab_size=args.vocab_size,
-        batch_size=args.batch_size,
+        chunk=args.chunk,
         tokenizer_file=args.tokenizer_path
     )
 
-    train_dataset[0]
+    sampler = TokenBatchSampler(
+        dataset=train_dataset,
+        tokens_per_batch=args.tokens_per_batch,
+        shuffle=True
+    )
+
+    train_loader = DataLoader(
+        dataset=train_dataset,
+        batch_sampler=sampler,
+        collate_fn=collate_fn
+    )
+
+    for src, target in train_loader:
+
+        src, target = src.to(device), target.to(device)
+        
+        output = model(src, target)
 
 def main():
     
